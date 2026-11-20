@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>swipe perf</title>
+    <style>
+      body { margin: 0; font: 13px/1.4 monospace; background: #111; color: #eee; }
+      #out { position: fixed; inset: 0 0 auto 400px; padding: 8px; white-space: pre-wrap; }
+      iframe { width: 390px; height: 844px; border: 0; display: block; }
+    </style>
+  </head>
+  <body>
+    <iframe id="f" title="app"></iframe>
+    <pre id="out" aria-live="polite">running…</pre>
+    <script>
+      // Swipe frame-cost harness. ?pages=a.html,b.html&css=1 (css=1 also tries will-change variants).
+      // Drives the first Recent row's face exactly as swipe-row.ts does on each pointermove
+      // (adds .dragging, writes an inline translateX), and times each frame two ways:
+      //   gap  = rAF to rAF (what the eye sees)
+      //   work = rAF callback start to the next task, i.e. style + layout + paint recording on the main thread.
+      const params = new URLSearchParams(location.search);
+      const pages = (params.get('pages') ?? 'da7b2a0.html').split(',');
+      const tryCss = params.get('css') === '1';
+      const out = document.getElementById('out');
+      const frame = document.getElementById('f');
+      const lines = [];
+      const log = (s) => { lines.push(s); out.textContent = lines.join('\n') + '\n…'; };
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      function load(src) {
+        return new Promise((resolve) => {
+          frame.onload = async () => {
+            const doc = frame.contentDocument;
+            for (let i = 0; i < 100 && !doc.querySelector('.swipe-face'); i++) await sleep(100);
+            await sleep(1500); // let the first-load entrance finish
+            resolve(frame.contentWindow);
+          };
+          frame.src = src + '?t=' + Date.now();
+        });
+      }
+
+      function stats(xs) {
+        const s = [...xs].sort((a, b) => a - b);
+        const q = (p) => s[Math.min(s.length - 1, Math.floor(p * s.length))];
+        const mean = s.reduce((a, b) => a + b, 0) / s.length;
+        return { mean, med: q(0.5), p95: q(0.95), max: s[s.length - 1] };
+      }
+
+      // Runs n frames, calling step(i) at the top of each rAF callback.
+      function run(win, n, step) {
+        return new Promise((resolve) => {
+          const gaps = [];
+          const work = [];
+          let last = null;
+          let i = 0;
+          const ch = new win.MessageChannel();
+          let started = 0;
+          ch.port1.onmessage = () => work.push(win.performance.now() - started);
+          function tick(t) {
+            if (last !== null) gaps.push(t - last);
+            last = t;
+            if (i >= n) { setTimeout(() => resolve({ gaps, work }), 50); return; }
+            started = win.performance.now();
+            step(i++);
+            ch.port2.postMessage(0);
+            win.requestAnimationFrame(tick);
+          }
+          win.requestAnimationFrame(tick);
+        });
+      }
+
+      const fmt = (r) => {
+        const g = stats(r.gaps);
+        const w = stats(r.work);
+        const slow = r.gaps.filter((x) => x > 20).length;
+        return `fps ${(1000 / g.mean).toFixed(1)}  gap med ${g.med.toFixed(1)} p95 ${g.p95.toFixed(1)} max ${g.max.toFixed(1)}  frames>20ms ${slow}/${r.gaps.length}  work med ${w.med.toFixed(2)} p95 ${w.p95.toFixed(2)} max ${w.max.toFixed(2)}ms`;
+      };
+
+      async function measure(win, label) {
+        const doc = win.document;
+        const face = doc.querySelector('.swipe-face');
+        const row = face.closest('.swipe-row');
+        const N = 240;
+        const idle = await run(win, N, () => {});
+        log(`${label} idle : ${fmt(idle)}`);
+        const drag = await run(win, N, (i) => {
+          if (i === 0) row.classList.add('dragging');
+          face.style.transform = `translateX(${(-88 * (0.5 - 0.5 * Math.cos(i / 15))).toFixed(2)}px)`;
+        });
+        row.classList.remove('dragging');
+        face.style.transform = '';
+        log(`${label} drag : ${fmt(drag)}`);
+        await sleep(400);
+        const settle = await run(win, N, (i) => {
+          if (i % 24 === 0) row.classList.toggle('open');
+        });
+        row.classList.remove('open');
+        log(`${label} settle: ${fmt(settle)}`);
+        await sleep(400);
+      }
+
+      const variants = [['as shipped', '']];
+      if (tryCss) {
+        variants.push(['will-change while dragging', '.swipe-row.dragging .swipe-face{will-change:transform}']);
+        variants.push(['will-change always', '.swipe-face{will-change:transform}']);
+      }
+
+      (async () => {
+        log(`UA ${navigator.userAgent}\ncores ${navigator.hardwareConcurrency}  dpr ${devicePixelRatio}`);
+        for (let round = 1; round <= 3; round++) {
+          for (const page of pages) {
+            for (const [name, css] of variants) {
+              const win = await load(page);
+              if (css) {
+                const st = win.document.createElement('style');
+                st.textContent = css;
+                win.document.head.append(st);
+                await sleep(200);
+              }
+              await measure(win, `r${round} ${page} [${name}]`);
+            }
+          }
+        }
+        out.textContent = lines.join('\n') + '\nDONE';
+      })();
+    </script>
+  </body>
+</html>
